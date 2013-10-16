@@ -31,6 +31,8 @@
 #include <unistd.h>
 #include <signal.h>
 #include <stdint.h>
+#include <regex.h>
+
 #include <X11/Xlib.h>
 #include <X11/keysym.h>
 #include <X11/Xatom.h>
@@ -198,7 +200,16 @@ typedef struct _GLFWlibraryX11
         unsigned char* buttons;
         int         buttonCount;
         char*       name;
+        char*       path;
     } joystick[GLFW_JOYSTICK_LAST + 1];
+
+#if defined(__linux__)
+    struct {
+      int           fd;
+      int           wd;
+      regex_t       regex;
+    } inotify;
+#endif
 
 } _GLFWlibraryX11;
 
@@ -238,7 +249,7 @@ void _glfwSetVideoMode(_GLFWmonitor* monitor, const GLFWvidmode* desired);
 void _glfwRestoreVideoMode(_GLFWmonitor* monitor);
 
 // Joystick input
-void _glfwInitJoysticks(void);
+int _glfwInitJoysticks(void);
 void _glfwTerminateJoysticks(void);
 
 // Unicode support

@@ -32,9 +32,9 @@
 
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/inotify.h>
 #include <fcntl.h>
 #include <errno.h>
-#include <regex.h>
 #include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,16 +44,34 @@
 
 // Attempt to open the specified joystick device
 //
-static int openJoystickDevice(int joy, const char* path)
+static void openJoystickDevice(const char* path)
 {
 #ifdef __linux__
     char axisCount, buttonCount;
     char name[256];
-    int fd, version;
+    int joy, fd, version;
+
+    for (joy = GLFW_JOYSTICK_1;  joy <= GLFW_JOYSTICK_LAST;  joy++)
+    {
+        if (!_glfw.x11.joystick[joy].present)
+            continue;
+
+        if (strcmp(_glfw.x11.joystick[joy].path, path) == 0)
+            return;
+    }
+
+    for (joy = GLFW_JOYSTICK_1;  joy <= GLFW_JOYSTICK_LAST;  joy++)
+    {
+        if (!_glfw.x11.joystick[joy].present)
+            break;
+    }
+
+    if (joy > GLFW_JOYSTICK_LAST)
+        return;
 
     fd = open(path, O_RDONLY | O_NONBLOCK);
     if (fd == -1)
-        return GL_FALSE;
+        return;
 
     _glfw.x11.joystick[joy].fd = fd;
 
@@ -63,13 +81,14 @@ static int openJoystickDevice(int joy, const char* path)
     {
         // It's an old 0.x interface (we don't support it)
         close(fd);
-        return GL_FALSE;
+        return;
     }
 
     if (ioctl(fd, JSIOCGNAME(sizeof(name)), name) < 0)
         strncpy(name, "Unknown", sizeof(name));
 
     _glfw.x11.joystick[joy].name = strdup(name);
+    _glfw.x11.joystick[joy].path = strdup(path);
 
     ioctl(fd, JSIOCGAXES, &axisCount);
     _glfw.x11.joystick[joy].axisCount = (int) axisCount;
@@ -82,8 +101,6 @@ static int openJoystickDevice(int joy, const char* path)
 
     _glfw.x11.joystick[joy].present = GL_TRUE;
 #endif // __linux__
-
-    return GL_TRUE;
 }
 
 // Polls for and processes events for all present joysticks
@@ -94,6 +111,25 @@ static void pollJoystickEvents(void)
     int i;
     ssize_t result;
     struct js_event e;
+    ssize_t offset = 0;
+    char buffer[16384];
+
+    const ssize_t size = read(_glfw.x11.inotify.fd, buffer, sizeof(buffer));
+
+    while (size > offset)
+    {
+        regmatch_t match;
+        const struct inotify_event* e = (struct inotify_event*) (buffer + offset);
+
+        if (regexec(&_glfw.x11.inotify.regex, e->name, 1, &match, 0) == 0)
+        {
+            char path[20];
+            snprintf(path, sizeof(path), "/dev/input/%s", e->name);
+            openJoystickDevice(path);
+        }
+
+        offset += sizeof(struct inotify_event) + e->len;
+    }
 
     for (i = 0;  i <= GLFW_JOYSTICK_LAST;  i++)
     {
@@ -111,6 +147,7 @@ static void pollJoystickEvents(void)
                 free(_glfw.x11.joystick[i].axes);
                 free(_glfw.x11.joystick[i].buttons);
                 free(_glfw.x11.joystick[i].name);
+                free(_glfw.x11.joystick[i].path);
                 _glfw.x11.joystick[i].present = GL_FALSE;
             }
 
@@ -156,51 +193,59 @@ static void pollJoystickEvents(void)
 
 // Initialize joystick interface
 //
-void _glfwInitJoysticks(void)
+int _glfwInitJoysticks(void)
 {
 #ifdef __linux__
-    int joy = 0;
-    size_t i;
-    regex_t regex;
+    const char* dirname = "/dev/input";
     DIR* dir;
-    const char* dirs[] =
-    {
-        "/dev/input",
-        "/dev"
-    };
+    struct dirent* entry;
 
-    if (regcomp(&regex, "^js[0-9]\\+$", 0) != 0)
+    _glfw.x11.inotify.fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if (_glfw.x11.inotify.fd == -1)
+    {
+        _glfwInputError(GLFW_PLATFORM_ERROR, "X11: Failed to initialize inotify");
+        return GL_FALSE;
+    }
+
+    _glfw.x11.inotify.wd = inotify_add_watch(_glfw.x11.inotify.fd,
+                                             dirname,
+                                             IN_CREATE | IN_ATTRIB);
+    if (_glfw.x11.inotify.wd == -1)
+    {
+        _glfwInputError(GLFW_PLATFORM_ERROR,
+                        "X11: Failed to add watch to %s", dirname);
+        return GL_FALSE;
+    }
+
+    if (regcomp(&_glfw.x11.inotify.regex, "^js[0-9]\\+$", 0) != 0)
     {
         _glfwInputError(GLFW_PLATFORM_ERROR, "X11: Failed to compile regex");
-        return;
+        return GL_FALSE;
     }
 
-    for (i = 0;  i < sizeof(dirs) / sizeof(dirs[0]);  i++)
+    dir = opendir(dirname);
+    if (!dir)
     {
-        struct dirent* entry;
+        _glfwInputError(GLFW_PLATFORM_ERROR, "X11: Failed to open %s", dirname);
+        return GL_FALSE;
+    }
 
-        dir = opendir(dirs[i]);
-        if (!dir)
+    while ((entry = readdir(dir)))
+    {
+        char path[20];
+        regmatch_t match;
+
+        if (regexec(&_glfw.x11.inotify.regex, entry->d_name, 1, &match, 0) != 0)
             continue;
 
-        while ((entry = readdir(dir)))
-        {
-            char path[20];
-            regmatch_t match;
-
-            if (regexec(&regex, entry->d_name, 1, &match, 0) != 0)
-                continue;
-
-            snprintf(path, sizeof(path), "%s/%s", dirs[i], entry->d_name);
-            if (openJoystickDevice(joy, path))
-                joy++;
-        }
-
-        closedir(dir);
+        snprintf(path, sizeof(path), "%s/%s", dirname, entry->d_name);
+        openJoystickDevice(path);
     }
 
-    regfree(&regex);
+    closedir(dir);
 #endif // __linux__
+
+    return GL_TRUE;
 }
 
 // Close all opened joystick handles
@@ -218,10 +263,19 @@ void _glfwTerminateJoysticks(void)
             free(_glfw.x11.joystick[i].axes);
             free(_glfw.x11.joystick[i].buttons);
             free(_glfw.x11.joystick[i].name);
+            free(_glfw.x11.joystick[i].path);
 
             _glfw.x11.joystick[i].present = GL_FALSE;
         }
     }
+
+    regfree(&_glfw.x11.inotify.regex);
+
+    if (_glfw.x11.inotify.wd > 0)
+        close(_glfw.x11.inotify.wd);
+
+    if (_glfw.x11.inotify.fd > 0)
+        close(_glfw.x11.inotify.fd);
 #endif // __linux__
 }
 

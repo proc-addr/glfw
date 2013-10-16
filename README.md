@@ -227,6 +227,7 @@ See the [GLFW documentation](http://www.glfw.org/docs/latest/).
  - [Cocoa] Bugfix: The cursor remained visible if moved onto client area after
                    having been set to hidden outside it
  - [Cocoa] Bugfix: The refresh rate was zero for all modes of certain monitors
+ - [X11] Added joystick hot-plugging using inotify (stop-gap until libudev)
  - [X11] Added setting of the `WM_CLASS` property to the initial window title
 
 
